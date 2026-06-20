@@ -6,36 +6,104 @@ import aiohttp
 from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    BufferedInputFile
+)
 from aiogram.filters import CommandStart
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 import database as db
 
-# -------------------- SETUP --------------------
+# ────────────────────────────────────────────
+# SETUP
+# ────────────────────────────────────────────
+
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",")]
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-BALE_BOT_TOKEN = os.getenv("BALE_BOT_TOKEN")
-BALE_CHANNEL_ID = os.getenv("BALE_CHANNEL_ID")
-BALE_CHANNEL_USERNAME = os.getenv("BALE_CHANNEL_USERNAME")
+BOT_TOKEN                 = os.getenv("BOT_TOKEN")
+ADMIN_IDS                 = [int(x.strip()) for x in os.getenv("ADMIN_IDS").split(",")]
+CHANNEL_ID                = os.getenv("CHANNEL_ID")
+BALE_BOT_TOKEN            = os.getenv("BALE_BOT_TOKEN")
+BALE_CHANNEL_ID           = os.getenv("BALE_CHANNEL_ID")
+BALE_CHANNEL_USERNAME     = os.getenv("BALE_CHANNEL_USERNAME")
 TELEGRAM_CHANNEL_USERNAME = os.getenv("TELEGRAM_CHANNEL_USERNAME")
-BALE_API_URL = f"https://tapi.bale.ai/bot{BALE_BOT_TOKEN}"
+BALE_API_URL              = f"https://tapi.bale.ai/bot{BALE_BOT_TOKEN}"
+
+# e.g. "@botetesterym" → "botetesterym"
+channel_slug = (TELEGRAM_CHANNEL_USERNAME or "").lstrip("@")
 
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp  = Dispatcher()
 
 
-# -------------------- USER: RECEIVE SUBMISSIONS --------------------
+# ────────────────────────────────────────────
+# HELPERS
+# ────────────────────────────────────────────
+
+def make_channel_link(channel_msg_id: int) -> str | None:
+    if not channel_slug or not channel_msg_id:
+        return None
+    return f"https://t.me/{channel_slug}/{channel_msg_id}"
+
+
+def build_admin_info_message(post, channel_link: str | None) -> str:
+    """
+    Compact, clear second message for admins.
+    One block of info — no redundant sentences.
+    """
+    post_id      = post["id"]
+    user_id      = post["user_id"]
+    content_type = post["content_type"]
+    sim_flag     = post["similarity_flag"]
+    sim_post_id  = post["similar_post_id"]
+
+    # Header line
+    lines = [
+        f"📬 Post #{post_id}  |  👤 {user_id}  |  📄 {content_type}",
+        "─" * 32,
+    ]
+
+    # Quality section
+    if sim_flag == "DUPLICATE":
+        lines.append(f"🚨 DUPLICATE of post #{sim_post_id}")
+        if channel_link:
+            lines.append(f"🔗 {channel_link}")
+        else:
+            lines.append(f"⚠️ Original post was not published to channel yet.")
+
+    elif sim_flag and sim_flag.startswith("SIMILAR:"):
+        percent = sim_flag.split(":")[1]
+        lines.append(f"⚠️ Similar to post #{sim_post_id}  ({percent}% word overlap)")
+        if channel_link:
+            lines.append(f"🔗 {channel_link}")
+
+    else:
+        lines.append("✅ No issues found.")
+
+    return "\n".join(lines)
+
+
+def build_admin_keyboard(post_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{post_id}"),
+            InlineKeyboardButton(text="❌ Reject",  callback_data=f"reject_{post_id}"),
+        ]
+    ])
+
+
+# ────────────────────────────────────────────
+# USER: RECEIVE SUBMISSIONS
+# ────────────────────────────────────────────
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     await message.answer(
-        "👋 Welcome! Send me a news post (text, photo with caption, or a link) "
+        "👋 Welcome!\n\n"
+        "Send me a news post — text, photo, video, or a link — "
         "and it will be reviewed by an admin before publishing."
     )
 
@@ -51,16 +119,36 @@ async def handle_photo(message: Message):
         text=caption,
         file_id=file_id
     )
+    await db.log_action(post_id, "submitted")
+    post = await db.get_post(post_id)
 
-    await message.answer("✅ Your post (with photo) was received and is pending admin review.")
+    await notify_user_if_flagged(message, post)
+    await message.answer("✅ Your post (photo) was received and is pending admin review.")
+    await send_to_admin(post_id)
+
+
+@dp.message(F.video)
+async def handle_video(message: Message):
+    file_id = message.video.file_id
+    caption = message.caption or ""
+
+    post_id = await db.add_post(
+        user_id=message.from_user.id,
+        content_type="video",
+        text=caption,
+        file_id=file_id
+    )
+    await db.log_action(post_id, "submitted")
+    post = await db.get_post(post_id)
+
+    await notify_user_if_flagged(message, post)
+    await message.answer("✅ Your post (video) was received and is pending admin review.")
     await send_to_admin(post_id)
 
 
 @dp.message(F.text)
 async def handle_text(message: Message):
     text = message.text
-
-    # Treat anything starting with http as a "link" type, otherwise "text"
     content_type = "link" if text.strip().lower().startswith("http") else "text"
 
     post_id = await db.add_post(
@@ -69,47 +157,102 @@ async def handle_text(message: Message):
         text=text,
         file_id=None
     )
+    await db.log_action(post_id, "submitted")
+    post = await db.get_post(post_id)
 
+    await notify_user_if_flagged(message, post)
     await message.answer("✅ Your post was received and is pending admin review.")
     await send_to_admin(post_id)
 
 
-# -------------------- SEND POST TO ADMIN FOR REVIEW --------------------
+async def notify_user_if_flagged(message: Message, post):
+    """
+    Privately inform the submitting user if their post is flagged.
+    The post still goes to the admin regardless.
+    """
+    sim_flag    = post["similarity_flag"]
+    sim_post_id = post["similar_post_id"]
+
+    if not sim_flag:
+        return
+
+    if sim_flag == "DUPLICATE":
+        await message.answer(
+            f"ℹ️ Your post is identical to a previously published post (#{sim_post_id}).\n"
+            f"It has still been sent to the admin for review."
+        )
+    elif sim_flag.startswith("SIMILAR:"):
+        percent = sim_flag.split(":")[1]
+        await message.answer(
+            f"ℹ️ Your post is {percent}% similar to a previously published post (#{sim_post_id}).\n"
+            f"It has still been sent to the admin for review."
+        )
+
+
+# ────────────────────────────────────────────
+# SEND TO ADMIN — TWO MESSAGES
+# ────────────────────────────────────────────
 
 async def send_to_admin(post_id: int):
+    """
+    Per submission, each admin gets exactly two messages:
+      1. The raw content exactly as the user sent it (no extra text)
+      2. A compact info card with warnings and action buttons
+    """
     post = await db.get_post(post_id)
-    # post columns: id, user_id, content_type, text, file_id, status
-    _, user_id, content_type, text, file_id, status = post
+    if not post:
+        return
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_{post_id}"),
-            InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_{post_id}")
-        ]
-    ])
+    content_type = post["content_type"]
+    text         = post["text"] or ""
+    file_id      = post["file_id"]
+    sim_post_id  = post["similar_post_id"]
 
-    caption_text = f"📝 New post #{post_id} from user {user_id}\n\n{text}"
+    # Resolve channel link for the original post (if it was published)
+    channel_link = None
+    if sim_post_id:
+        original = await db.get_post(sim_post_id)
+        if original and original["channel_msg_id"]:
+            channel_link = make_channel_link(original["channel_msg_id"])
+
+    info_text = build_admin_info_message(post, channel_link)
+    keyboard  = build_admin_keyboard(post_id)
 
     for admin_id in ADMIN_IDS:
         try:
-            if content_type == "photo":
+            # ── Message 1: raw content ───────────────────────────
+            if content_type == "photo" and file_id:
                 await bot.send_photo(
                     chat_id=admin_id,
                     photo=file_id,
-                    caption=caption_text,
-                    reply_markup=keyboard
+                    caption=text or None
+                )
+            elif content_type == "video" and file_id:
+                await bot.send_video(
+                    chat_id=admin_id,
+                    video=file_id,
+                    caption=text or None
                 )
             else:
                 await bot.send_message(
                     chat_id=admin_id,
-                    text=caption_text,
-                    reply_markup=keyboard
+                    text=text
                 )
+
+            # ── Message 2: info card + buttons ───────────────────
+            await bot.send_message(
+                chat_id=admin_id,
+                text=info_text,
+                reply_markup=keyboard
+            )
+
         except Exception as e:
-            logging.warning(f"Could not send to admin {admin_id}: {e}")
+            logging.warning(f"Could not message admin {admin_id}: {e}")
 
 
-# -------------------- ADMIN: APPROVE / REJECT --------------------
+# ────────────────────────────────────────────
+# ADMIN: APPROVE
+# ────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("approve_"))
 async def handle_approve(callback: CallbackQuery):
@@ -118,41 +261,44 @@ async def handle_approve(callback: CallbackQuery):
         return
 
     post_id = int(callback.data.split("_")[1])
-    post = await db.get_post(post_id)
+    post    = await db.get_post(post_id)
 
     if post is None:
         await callback.answer("Post not found.", show_alert=True)
         return
 
-    _, user_id, content_type, text, file_id, status = post
-
-    if status != "pending":
-        await callback.answer(f"This post is already '{status}'.", show_alert=True)
+    if post["status"] != "pending":
+        await callback.answer(f"This post is already '{post['status']}'.", show_alert=True)
         return
 
-    # Mark as approved first
     await db.update_status(post_id, "approved")
+    await db.log_action(post_id, "approved")
 
-    # Publish to Telegram channel
-    await publish_to_telegram_channel(content_type, text, file_id)
+    channel_msg_id = await publish_to_telegram_channel(
+        post["content_type"], post["text"], post["file_id"]
+    )
+    if channel_msg_id:
+        await db.save_channel_msg_id(post_id, channel_msg_id)
 
-    # # Publish to Bale channel
-    # await publish_to_bale_channel(content_type, text, file_id)
-
-    # Mark as published
     await db.update_status(post_id, "published")
+    await db.log_action(post_id, "published")
 
-    # Update the admin's message
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.reply(f"✅ Post #{post_id} approved and published to both channels.")
+    await callback.message.reply(f"✅ Post #{post_id} approved and published.")
     await callback.answer("Published!")
 
-    # Notify the original user
     try:
-        await bot.send_message(user_id, f"🎉 Your post #{post_id} was approved and published!")
+        await bot.send_message(
+            post["user_id"],
+            f"🎉 Your post #{post_id} was approved and published!"
+        )
     except Exception as e:
-        logging.warning(f"Could not notify user {user_id}: {e}")
+        logging.warning(f"Could not notify user {post['user_id']}: {e}")
 
+
+# ────────────────────────────────────────────
+# ADMIN: REJECT
+# ────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("reject_"))
 async def handle_reject(callback: CallbackQuery):
@@ -161,116 +307,96 @@ async def handle_reject(callback: CallbackQuery):
         return
 
     post_id = int(callback.data.split("_")[1])
-    post = await db.get_post(post_id)
+    post    = await db.get_post(post_id)
 
     if post is None:
         await callback.answer("Post not found.", show_alert=True)
         return
 
-    _, user_id, content_type, text, file_id, status = post
-
-    if status != "pending":
-        await callback.answer(f"This post is already '{status}'.", show_alert=True)
+    if post["status"] != "pending":
+        await callback.answer(f"This post is already '{post['status']}'.", show_alert=True)
         return
 
     await db.update_status(post_id, "rejected")
+    await db.log_action(post_id, "rejected")
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.reply(f"❌ Post #{post_id} rejected.")
     await callback.answer("Rejected.")
 
     try:
-        await bot.send_message(user_id, f"😔 Your post #{post_id} was rejected by the admin.")
+        await bot.send_message(
+            post["user_id"],
+            f"😔 Your post #{post_id} was reviewed but not selected for publication."
+        )
     except Exception as e:
-        logging.warning(f"Could not notify user {user_id}: {e}")
+        logging.warning(f"Could not notify user {post['user_id']}: {e}")
 
 
-# -------------------- PUBLISHING FUNCTIONS --------------------
+# ────────────────────────────────────────────
+# PUBLISHING
+# ────────────────────────────────────────────
 
-async def publish_to_telegram_channel(content_type: str, text: str, file_id: str):
-    """Publish the approved post to the Telegram channel."""
+async def publish_to_telegram_channel(content_type: str, text: str, file_id: str) -> int | None:
+    """Publish to the Telegram channel. Returns the message ID."""
     try:
-        if content_type == "photo":
-            await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text)
+        if content_type == "photo" and file_id:
+            sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text or None)
+        elif content_type == "video" and file_id:
+            sent = await bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=text or None)
         else:
-            await bot.send_message(chat_id=CHANNEL_ID, text=text)
+            sent = await bot.send_message(chat_id=CHANNEL_ID, text=text)
+        return sent.message_id
     except Exception as e:
         logging.error(f"Failed to publish to Telegram channel: {e}")
+        return None
 
 
-# async def publish_to_bale_channel(content_type: str, text: str, file_id: str):
-#     """
-#     Publish the approved post to the Bale channel.
-#     Bale's Bot API is similar to Telegram's, base URL: https://tapi.bale.ai/bot<TOKEN>/
-#     NOTE: file_id from Telegram CANNOT be reused on Bale (different servers).
-#     So for photos, we download from Telegram and re-upload to Bale.
-#     """
-#     base_url = f"https://tapi.bale.ai/bot{BALE_BOT_TOKEN}"
-
-#     try:
-#         async with aiohttp.ClientSession() as session:
-#             if content_type == "photo":
-#                 # Download the photo bytes from Telegram
-#                 file = await bot.get_file(file_id)
-#                 file_bytes_io = await bot.download_file(file.file_path)
-#                 photo_bytes = file_bytes_io.read()
-
-#                 form = aiohttp.FormData()
-#                 form.add_field("chat_id", BALE_CHANNEL_ID)
-#                 form.add_field("caption", text)
-#                 form.add_field("photo", photo_bytes, filename="photo.jpg", content_type="image/jpeg")
-
-#                 async with session.post(f"{base_url}/sendPhoto", data=form) as resp:
-#                     if resp.status != 200:
-#                         body = await resp.text()
-#                         logging.error(f"Bale sendPhoto failed: {resp.status} {body}")
-#             else:
-#                 payload = {"chat_id": BALE_CHANNEL_ID, "text": text}
-#                 async with session.post(f"{base_url}/sendMessage", json=payload) as resp:
-#                     if resp.status != 200:
-#                         body = await resp.text()
-#                         logging.error(f"Bale sendMessage failed: {resp.status} {body}")
-#     except Exception as e:
-#         logging.error(f"Failed to publish to Bale channel: {e}")
-
-
-# -------------------- BALE CHANNEL LISTENER --------------------
+# ────────────────────────────────────────────
+# BALE CHANNEL LISTENER
+# ────────────────────────────────────────────
 
 async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
-    """Process a new post from the Bale channel and forward it to Telegram."""
-    text = post.get("text") or post.get("caption") or ""
+    text     = post.get("text") or post.get("caption") or ""
     new_text = text.replace(BALE_CHANNEL_USERNAME, TELEGRAM_CHANNEL_USERNAME)
 
     if "photo" in post:
-        # Get largest photo
         file_id = post["photo"][-1]["file_id"]
-
-        # Ask Bale for the file path
         async with session.get(f"{BALE_API_URL}/getFile", params={"file_id": file_id}) as resp:
             file_data = await resp.json()
-
         if not file_data.get("ok"):
             logging.error(f"Bale getFile failed: {file_data}")
             return
-
         file_path = file_data["result"]["file_path"]
-        file_url = f"https://tapi.bale.ai/file/bot{BALE_BOT_TOKEN}/{file_path}"
-
+        file_url  = f"https://tapi.bale.ai/file/bot{BALE_BOT_TOKEN}/{file_path}"
         async with session.get(file_url) as resp:
             photo_bytes = await resp.read()
-
         photo_file = BufferedInputFile(photo_bytes, filename="photo.jpg")
         await bot.send_photo(chat_id=CHANNEL_ID, photo=photo_file, caption=new_text)
+
+    elif "video" in post:
+        file_id = post["video"]["file_id"]
+        async with session.get(f"{BALE_API_URL}/getFile", params={"file_id": file_id}) as resp:
+            file_data = await resp.json()
+        if not file_data.get("ok"):
+            logging.error(f"Bale getFile (video) failed: {file_data}")
+            return
+        file_path = file_data["result"]["file_path"]
+        file_url  = f"https://tapi.bale.ai/file/bot{BALE_BOT_TOKEN}/{file_path}"
+        async with session.get(file_url) as resp:
+            video_bytes = await resp.read()
+        video_file = BufferedInputFile(video_bytes, filename="video.mp4")
+        await bot.send_video(chat_id=CHANNEL_ID, video=video_file, caption=new_text)
+
     else:
         if new_text.strip():
             await bot.send_message(chat_id=CHANNEL_ID, text=new_text)
 
 
 async def bale_listener():
-    """Continuously poll Bale for new channel posts and forward them to Telegram."""
     offset = 0
     async with aiohttp.ClientSession() as session:
-        logging.info("Bale listener started, polling for updates...")
+        logging.info("Bale listener started.")
         while True:
             try:
                 params = {"offset": offset, "timeout": 30}
@@ -287,7 +413,7 @@ async def bale_listener():
                     continue
 
                 for update in data.get("result", []):
-                    offset = update["update_id"] + 1
+                    offset  = update["update_id"] + 1
                     message = update.get("message")
                     if message and message.get("chat", {}).get("type") == "channel":
                         try:
@@ -298,15 +424,20 @@ async def bale_listener():
             except Exception as e:
                 logging.error(f"Bale listener error: {e}")
                 await asyncio.sleep(5)
-# -------------------- MAIN --------------------
+
+
+# ────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────
 
 async def main():
     await db.init_db()
-    logging.info("Database initialized. Starting bot and Bale listener...")
+    logging.info("Database ready. Bot is starting…")
     await asyncio.gather(
         dp.start_polling(bot),
         bale_listener()
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
