@@ -1,7 +1,7 @@
 import hashlib
 import re
 import aiosqlite
-from datetime import datetime
+from datetime import datetime, date
 
 DB_NAME = "posts.db"
 
@@ -48,17 +48,13 @@ def compute_similarity(text_a: str, text_b: str) -> float:
 
 
 # ────────────────────────────────────────────
-# DATABASE SETUP  —  with safe migration
+# DATABASE SETUP  —  safe migration
 # ────────────────────────────────────────────
 
 async def init_db():
-    """
-    Creates all tables and safely adds any missing columns.
-    Running this on an existing database will NOT delete any data.
-    """
     async with aiosqlite.connect(DB_NAME) as db:
 
-        # ── posts table ──────────────────────────────────────────
+        # posts
         await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,8 +66,7 @@ async def init_db():
             )
         """)
 
-        # ── sources table (new in Phase 1.3) ─────────────────────
-        # Stores the list of RSS feeds to poll
+        # sources (RSS feeds)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sources (
                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +78,7 @@ async def init_db():
             )
         """)
 
-        # ── logs table ───────────────────────────────────────────
+        # logs
         await db.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,23 +88,28 @@ async def init_db():
             )
         """)
 
+        # blocked users  ← NEW
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_users (
+                user_id    INTEGER PRIMARY KEY,
+                reason     TEXT,
+                blocked_at TEXT NOT NULL
+            )
+        """)
+
         await db.commit()
 
-        # ── Safe migration: add columns that may not exist yet ───
-        # If the column already exists, the ALTER TABLE throws an error
-        # which we catch and ignore. This is safe and standard practice.
+        # Safe column migrations — never deletes data
         new_columns = [
             ("normalized_text", "TEXT"),
             ("hash",            "TEXT"),
             ("similarity_flag", "TEXT"),
             ("similar_post_id", "INTEGER"),
             ("channel_msg_id",  "INTEGER"),
-            # Phase 1.3 additions:
-            ("source_type",     "TEXT DEFAULT 'user'"),   # "user" or "rss"
-            ("source_name",     "TEXT"),                  # e.g. "Zoomit"
-            ("source_url",      "TEXT"),                  # direct link to article
+            ("source_type",     "TEXT DEFAULT 'user'"),
+            ("source_name",     "TEXT"),
+            ("source_url",      "TEXT"),
         ]
-
         for col_name, col_definition in new_columns:
             try:
                 await db.execute(
@@ -117,15 +117,84 @@ async def init_db():
                 )
                 await db.commit()
             except Exception:
-                pass  # Column already exists — no action needed
+                pass
 
 
 # ────────────────────────────────────────────
-# SOURCES  (RSS feed management)
+# BLOCKED USERS
+# ────────────────────────────────────────────
+
+async def block_user(user_id: int, reason: str = ""):
+    """Add a user to the blocked list."""
+    blocked_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO blocked_users (user_id, reason, blocked_at) VALUES (?, ?, ?)",
+            (user_id, reason, blocked_at)
+        )
+        await db.commit()
+
+
+async def unblock_user(user_id: int):
+    """Remove a user from the blocked list."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "DELETE FROM blocked_users WHERE user_id = ?", (user_id,)
+        )
+        await db.commit()
+
+
+async def is_user_blocked(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT user_id FROM blocked_users WHERE user_id = ?", (user_id,)
+        )
+        return await cursor.fetchone() is not None
+
+
+# ────────────────────────────────────────────
+# RATE LIMITING  —  1 submission per minute per user
+# Stored in memory (resets when bot restarts, which is fine)
+# ────────────────────────────────────────────
+
+# How many seconds a user must wait between submissions
+RATE_LIMIT_SECONDS = 60
+
+# Dict:  user_id  →  timestamp of their last submission
+_last_submission: dict[int, datetime] = {}
+
+
+def check_rate_limit(user_id: int) -> int:
+    """
+    Check if the user is allowed to post right now.
+    Returns 0 if allowed, or the number of seconds they must still wait.
+    Always call BEFORE inserting a post.
+    """
+    now = datetime.utcnow()
+    last = _last_submission.get(user_id)
+
+    if last is None:
+        return 0  # First time posting — always allowed
+
+    elapsed = (now - last).total_seconds()
+    remaining = RATE_LIMIT_SECONDS - elapsed
+
+    return max(0, int(remaining))
+
+
+def record_submission(user_id: int):
+    """
+    Record that this user just submitted a post.
+    Call this AFTER successfully inserting the post.
+    """
+    _last_submission[user_id] = datetime.utcnow()
+
+
+# ────────────────────────────────────────────
+# SOURCES
 # ────────────────────────────────────────────
 
 async def add_source(name: str, url: str, priority: int = 5) -> int:
-    """Add a new RSS source. Returns its ID."""
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             "INSERT OR IGNORE INTO sources (name, type, url, active, priority) VALUES (?, 'rss', ?, 1, ?)",
@@ -136,7 +205,6 @@ async def add_source(name: str, url: str, priority: int = 5) -> int:
 
 
 async def get_active_sources():
-    """Return all active RSS sources, sorted by priority (lowest number = highest priority)."""
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
@@ -146,7 +214,6 @@ async def get_active_sources():
 
 
 async def set_source_active(source_id: int, active: bool):
-    """Enable or disable an RSS source without deleting it."""
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "UPDATE sources SET active = ? WHERE id = ?",
@@ -168,11 +235,6 @@ async def add_post(
     source_name: str = None,
     source_url: str = None,
 ) -> int:
-    """
-    Insert a new post (from a user OR from RSS).
-    Automatically runs duplicate and similarity checks.
-    Returns the new post's ID.
-    """
     norm = normalize_text(text or "")
     h    = make_hash(norm)
     similarity_flag = None
@@ -180,19 +242,16 @@ async def add_post(
 
     async with aiosqlite.connect(DB_NAME) as db:
 
-        # ── Duplicate check (only against published posts) ───────
+        # Duplicate check — only published posts count
         cursor = await db.execute(
-            "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1",
-            (h,)
+            "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1", (h,)
         )
         duplicate_row = await cursor.fetchone()
 
         if duplicate_row:
             similar_post_id = duplicate_row[0]
             similarity_flag = "DUPLICATE"
-
         else:
-            # ── Similarity check (only against published posts) ──
             cursor = await db.execute(
                 """SELECT id, normalized_text FROM posts
                    WHERE status = 'published'
@@ -200,16 +259,13 @@ async def add_post(
             )
             recent_posts = await cursor.fetchall()
 
-            SIMILARITY_THRESHOLD = 0.60
-
             for existing_id, existing_norm in recent_posts:
                 if not existing_norm:
                     continue
                 score = compute_similarity(norm, existing_norm)
-                if score >= SIMILARITY_THRESHOLD:
-                    percent = int(score * 100)
+                if score >= 0.60:
                     similar_post_id = existing_id
-                    similarity_flag = f"SIMILAR:{percent}"
+                    similarity_flag = f"SIMILAR:{int(score * 100)}"
                     break
 
         cursor = await db.execute(
@@ -234,18 +290,11 @@ async def get_post(post_id: int):
 
 
 async def hash_already_seen(h: str) -> bool:
-    """
-    Quick check: has this exact hash appeared in ANY post before?
-    (pending, approved, published, rejected — any status)
-    Used by the RSS fetcher to avoid re-submitting the same article
-    on every poll cycle.
-    """
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             "SELECT id FROM posts WHERE hash = ? LIMIT 1", (h,)
         )
-        row = await cursor.fetchone()
-        return row is not None
+        return await cursor.fetchone() is not None
 
 
 async def update_status(post_id: int, status: str):
@@ -262,6 +311,93 @@ async def save_channel_msg_id(post_id: int, msg_id: int):
             "UPDATE posts SET channel_msg_id = ? WHERE id = ?", (msg_id, post_id)
         )
         await db.commit()
+
+
+# ────────────────────────────────────────────
+# STATS  (for /status command)
+# ────────────────────────────────────────────
+
+async def get_stats() -> dict:
+    """Return a summary dict used by the /status admin command."""
+    today = date.today().strftime("%Y-%m-%d")
+
+    async with aiosqlite.connect(DB_NAME) as db:
+
+        # Pending posts (all time)
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM posts WHERE status = 'pending'"
+        )
+        pending = (await cursor.fetchone())[0]
+
+        # Published today
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM logs
+               WHERE action = 'published' AND timestamp LIKE ?""",
+            (f"{today}%",)
+        )
+        published_today = (await cursor.fetchone())[0]
+
+        # Rejected today
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM logs
+               WHERE action = 'rejected' AND timestamp LIKE ?""",
+            (f"{today}%",)
+        )
+        rejected_today = (await cursor.fetchone())[0]
+
+        # Submitted today (user only)
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM logs l
+               JOIN posts p ON l.post_id = p.id
+               WHERE l.action = 'submitted'
+               AND p.source_type = 'user'
+               AND l.timestamp LIKE ?""",
+            (f"{today}%",)
+        )
+        user_submitted_today = (await cursor.fetchone())[0]
+
+        # RSS fetched today
+        cursor = await db.execute(
+            """SELECT COUNT(*) FROM logs
+               WHERE action = 'rss_fetched' AND timestamp LIKE ?""",
+            (f"{today}%",)
+        )
+        rss_today = (await cursor.fetchone())[0]
+
+        # Active RSS sources
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM sources WHERE active = 1"
+        )
+        active_sources = (await cursor.fetchone())[0]
+
+        # Blocked users
+        cursor = await db.execute("SELECT COUNT(*) FROM blocked_users")
+        blocked_count = (await cursor.fetchone())[0]
+
+    return {
+        "pending":              pending,
+        "published_today":      published_today,
+        "rejected_today":       rejected_today,
+        "user_submitted_today": user_submitted_today,
+        "rss_today":            rss_today,
+        "active_sources":       active_sources,
+        "blocked_users":        blocked_count,
+    }
+
+
+async def get_pending_posts(limit: int = 10) -> list:
+    """Return the oldest pending posts for the /pending command."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """SELECT id, user_id, source_type, source_name, content_type, text
+               FROM posts
+               WHERE status = 'pending'
+               ORDER BY id ASC
+               LIMIT ?""",
+            (limit,)
+        )
+        return await cursor.fetchall()
 
 
 # ────────────────────────────────────────────
