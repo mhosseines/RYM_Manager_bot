@@ -30,7 +30,7 @@ def compute_similarity(text_a: str, text_b: str) -> float:
     stop_words = {
         "the", "a", "an", "and", "or", "but", "in", "on", "at", "to",
         "for", "of", "with", "by", "from", "is", "it", "this", "that",
-        "was", "are", "be", "as", "at", "so", "we", "he", "she", "they",
+        "was", "are", "be", "as", "so", "we", "he", "she", "they",
         "his", "her", "our", "its", "not", "no", "up", "out", "if", "do",
         "did", "has", "had", "have", "can", "will", "just", "been", "also",
         "than", "then", "when", "what", "which", "who", "how", "all", "each"
@@ -53,17 +53,16 @@ def compute_similarity(text_a: str, text_b: str) -> float:
 
 async def init_db():
     """
-    Create tables if they don't exist, then safely add any missing columns.
-    This means you NEVER need to delete posts.db when we add new columns.
-    Old data is always preserved.
+    Creates all tables and safely adds any missing columns.
+    Running this on an existing database will NOT delete any data.
     """
     async with aiosqlite.connect(DB_NAME) as db:
 
-        # Create posts table (base structure)
+        # ── posts table ──────────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id          INTEGER NOT NULL,
+                user_id          INTEGER,
                 content_type     TEXT NOT NULL,
                 text             TEXT,
                 file_id          TEXT,
@@ -71,7 +70,20 @@ async def init_db():
             )
         """)
 
-        # Create logs table
+        # ── sources table (new in Phase 1.3) ─────────────────────
+        # Stores the list of RSS feeds to poll
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sources (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                name     TEXT NOT NULL,
+                type     TEXT NOT NULL DEFAULT 'rss',
+                url      TEXT NOT NULL UNIQUE,
+                active   INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 5
+            )
+        """)
+
+        # ── logs table ───────────────────────────────────────────
         await db.execute("""
             CREATE TABLE IF NOT EXISTS logs (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,46 +95,92 @@ async def init_db():
 
         await db.commit()
 
-        # ── Safe migration: add columns that might not exist yet ──
-        # We try to add each column; if it already exists, SQLite throws
-        # an error which we silently ignore. This way old databases are
-        # upgraded automatically without losing any data.
+        # ── Safe migration: add columns that may not exist yet ───
+        # If the column already exists, the ALTER TABLE throws an error
+        # which we catch and ignore. This is safe and standard practice.
         new_columns = [
             ("normalized_text", "TEXT"),
             ("hash",            "TEXT"),
             ("similarity_flag", "TEXT"),
             ("similar_post_id", "INTEGER"),
             ("channel_msg_id",  "INTEGER"),
+            # Phase 1.3 additions:
+            ("source_type",     "TEXT DEFAULT 'user'"),   # "user" or "rss"
+            ("source_name",     "TEXT"),                  # e.g. "Zoomit"
+            ("source_url",      "TEXT"),                  # direct link to article
         ]
 
-        for col_name, col_type in new_columns:
+        for col_name, col_definition in new_columns:
             try:
                 await db.execute(
-                    f"ALTER TABLE posts ADD COLUMN {col_name} {col_type}"
+                    f"ALTER TABLE posts ADD COLUMN {col_name} {col_definition}"
                 )
                 await db.commit()
             except Exception:
-                # Column already exists — that's fine, skip it
-                pass
+                pass  # Column already exists — no action needed
+
+
+# ────────────────────────────────────────────
+# SOURCES  (RSS feed management)
+# ────────────────────────────────────────────
+
+async def add_source(name: str, url: str, priority: int = 5) -> int:
+    """Add a new RSS source. Returns its ID."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO sources (name, type, url, active, priority) VALUES (?, 'rss', ?, 1, ?)",
+            (name, url, priority)
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_active_sources():
+    """Return all active RSS sources, sorted by priority (lowest number = highest priority)."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM sources WHERE active = 1 ORDER BY priority ASC"
+        )
+        return await cursor.fetchall()
+
+
+async def set_source_active(source_id: int, active: bool):
+    """Enable or disable an RSS source without deleting it."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE sources SET active = ? WHERE id = ?",
+            (1 if active else 0, source_id)
+        )
+        await db.commit()
 
 
 # ────────────────────────────────────────────
 # POSTS
 # ────────────────────────────────────────────
 
-async def add_post(user_id: int, content_type: str, text: str, file_id: str = None) -> int:
+async def add_post(
+    content_type: str,
+    text: str,
+    user_id: int = None,
+    file_id: str = None,
+    source_type: str = "user",
+    source_name: str = None,
+    source_url: str = None,
+) -> int:
+    """
+    Insert a new post (from a user OR from RSS).
+    Automatically runs duplicate and similarity checks.
+    Returns the new post's ID.
+    """
     norm = normalize_text(text or "")
-    h = make_hash(norm)
+    h    = make_hash(norm)
     similarity_flag = None
     similar_post_id = None
 
     async with aiosqlite.connect(DB_NAME) as db:
 
-        # ── Duplicate check ──────────────────────────────────────
-        # Only compare against PUBLISHED posts.
-        # Pending or rejected posts don't count — they were never
-        # confirmed as real news, so a new submission of the same
-        # text is perfectly valid.
+        # ── Duplicate check (only against published posts) ───────
         cursor = await db.execute(
             "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1",
             (h,)
@@ -134,8 +192,7 @@ async def add_post(user_id: int, content_type: str, text: str, file_id: str = No
             similarity_flag = "DUPLICATE"
 
         else:
-            # ── Similarity check ─────────────────────────────────
-            # Again, only compare against published posts
+            # ── Similarity check (only against published posts) ──
             cursor = await db.execute(
                 """SELECT id, normalized_text FROM posts
                    WHERE status = 'published'
@@ -158,9 +215,12 @@ async def add_post(user_id: int, content_type: str, text: str, file_id: str = No
         cursor = await db.execute(
             """INSERT INTO posts
                (user_id, content_type, text, file_id, status,
-                normalized_text, hash, similarity_flag, similar_post_id)
-               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
-            (user_id, content_type, text, file_id, norm, h, similarity_flag, similar_post_id)
+                normalized_text, hash, similarity_flag, similar_post_id,
+                source_type, source_name, source_url)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, content_type, text, file_id,
+             norm, h, similarity_flag, similar_post_id,
+             source_type, source_name, source_url)
         )
         await db.commit()
         return cursor.lastrowid
@@ -171,6 +231,21 @@ async def get_post(post_id: int):
         db.row_factory = aiosqlite.Row
         cursor = await db.execute("SELECT * FROM posts WHERE id = ?", (post_id,))
         return await cursor.fetchone()
+
+
+async def hash_already_seen(h: str) -> bool:
+    """
+    Quick check: has this exact hash appeared in ANY post before?
+    (pending, approved, published, rejected — any status)
+    Used by the RSS fetcher to avoid re-submitting the same article
+    on every poll cycle.
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT id FROM posts WHERE hash = ? LIMIT 1", (h,)
+        )
+        row = await cursor.fetchone()
+        return row is not None
 
 
 async def update_status(post_id: int, status: str):
