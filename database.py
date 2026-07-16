@@ -280,6 +280,87 @@ async def add_post(
         )
         await db.commit()
         return cursor.lastrowid
+    
+
+async def check_duplicate(text: str):
+        """
+        Read-only duplicate check against already-published posts.
+        Does NOT insert anything into the database — safe to call
+        before deciding whether to publish something.
+
+        Returns a tuple: (flag, similar_post_id, normalized_text, hash)
+        flag is one of: None, "DUPLICATE", "SIMILAR:<percent>"
+        """
+        norm = normalize_text(text or "")
+        h = make_hash(norm)
+
+        # Empty text (e.g. a photo with no caption) can't be meaningfully
+        # compared — skip the check entirely to avoid false "duplicate" hits.
+        if not norm.strip():
+            return None, None, norm, h
+
+        similarity_flag = None
+        similar_post_id = None
+
+        async with aiosqlite.connect(DB_NAME) as db:
+            cursor = await db.execute(
+                "SELECT id FROM posts WHERE hash = ? AND status = 'published' LIMIT 1", (h,)
+            )
+            duplicate_row = await cursor.fetchone()
+
+            if duplicate_row:
+                similar_post_id = duplicate_row[0]
+                similarity_flag = "DUPLICATE"
+            else:
+                cursor = await db.execute(
+                    """SELECT id, normalized_text FROM posts
+                    WHERE status = 'published'
+                    ORDER BY id DESC LIMIT 50"""
+                )
+                recent_posts = await cursor.fetchall()
+
+                for existing_id, existing_norm in recent_posts:
+                    if not existing_norm:
+                        continue
+                    score = compute_similarity(norm, existing_norm)
+                    if score >= 0.60:
+                        similar_post_id = existing_id
+                        similarity_flag = f"SIMILAR:{int(score * 100)}"
+                        break
+
+        return similarity_flag, similar_post_id, norm, h
+
+
+async def add_published_post(
+    content_type: str,
+    text: str,
+    file_id: str = None,
+    source_type: str = "bale",
+    source_name: str = None,
+    source_url: str = None,
+    channel_msg_id: int = None,
+) -> int:
+    """
+    Insert a post that has ALREADY been published (used for content
+    forwarded from Bale). Stored directly with status='published' so:
+      1) it counts correctly in /status stats
+      2) future duplicate checks (from users, RSS, or Bale) can match it
+    """
+    norm = normalize_text(text or "")
+    h = make_hash(norm)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            """INSERT INTO posts
+               (user_id, content_type, text, file_id, status,
+                normalized_text, hash, similarity_flag, similar_post_id,
+                source_type, source_name, source_url, channel_msg_id)
+               VALUES (NULL, ?, ?, ?, 'published', ?, ?, NULL, NULL, ?, ?, ?, ?)""",
+            (content_type, text, file_id, norm, h,
+             source_type, source_name, source_url, channel_msg_id)
+        )
+        await db.commit()
+        return cursor.lastrowid
 
 
 async def get_post(post_id: int):

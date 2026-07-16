@@ -640,6 +640,38 @@ async def notify_user_if_flagged(message: Message, post):
             f"با این حال برای بررسی به ادمین ارسال شد."
         )
 
+# ────────────────────────────────────────────
+# CHANNEL PUBLISH THROTTLING
+# Every message sent to the Telegram channel — whether it came from
+# an admin approving a post, or from the Bale listener — passes
+# through here. This guarantees at least PUBLISH_INTERVAL_SECONDS
+# between any two channel posts, so we never flood the channel.
+# ────────────────────────────────────────────
+
+PUBLISH_INTERVAL_SECONDS = 15  # minimum gap between channel posts — change freely
+
+_publish_lock = asyncio.Lock()
+_last_publish_at = 0.0
+
+
+async def throttled_publish(send_func):
+    """
+    Runs send_func() (an async no-arg callable that actually sends
+    the message) while guaranteeing at least PUBLISH_INTERVAL_SECONDS
+    has passed since the previous channel post. If several posts want
+    to go out at once, they simply wait their turn — none are dropped.
+    """
+    global _last_publish_at
+    async with _publish_lock:
+        now = asyncio.get_event_loop().time()
+        wait_for = PUBLISH_INTERVAL_SECONDS - (now - _last_publish_at)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        result = await send_func()
+        _last_publish_at = asyncio.get_event_loop().time()
+        return result
+
+
 
 # ────────────────────────────────────────────
 # SEND TO ADMIN — TWO MESSAGES
@@ -780,18 +812,20 @@ async def handle_reject(callback: CallbackQuery):
 # ────────────────────────────────────────────
 
 async def publish_to_telegram_channel(content_type: str, text: str, file_id: str) -> int | None:
-    try:
+    async def _send():
         if content_type == "photo" and file_id:
-            sent = await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text or None)
+            return await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=text or None)
         elif content_type == "video" and file_id:
-            sent = await bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=text or None)
+            return await bot.send_video(chat_id=CHANNEL_ID, video=file_id, caption=text or None)
         else:
-            sent = await bot.send_message(chat_id=CHANNEL_ID, text=text)
+            return await bot.send_message(chat_id=CHANNEL_ID, text=text)
+
+    try:
+        sent = await throttled_publish(_send)
         return sent.message_id
     except Exception as e:
         logging.error(f"Failed to publish to Telegram channel: {e}")
         return None
-
 
 # ────────────────────────────────────────────
 # BALE LISTENER
@@ -801,7 +835,21 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
     text     = post.get("text") or post.get("caption") or ""
     new_text = text.replace(BALE_CHANNEL_USERNAME, TELEGRAM_CHANNEL_USERNAME)
 
+    # ── Duplicate check FIRST (before downloading any photo/video) ──
+    # Only blocks EXACT duplicates. Bale has no admin review step,
+    # so we only auto-block when we're fully sure — near-similar
+    # content still gets published.
+    flag, similar_post_id, _norm, _hash = await db.check_duplicate(new_text)
+    if flag == "DUPLICATE":
+        logging.info(f"Bale post skipped — duplicate of published post #{similar_post_id}")
+        return
+
+    content_type   = "text"
+    file_id_for_db = None
+    sent            = None
+
     if "photo" in post:
+        content_type = "photo"
         file_id = post["photo"][-1]["file_id"]
         async with session.get(f"{BALE_API_URL}/getFile", params={"file_id": file_id}) as resp:
             file_data = await resp.json()
@@ -810,12 +858,22 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
         file_path = file_data["result"]["file_path"]
         async with session.get(f"https://tapi.bale.ai/file/bot{BALE_BOT_TOKEN}/{file_path}") as resp:
             photo_bytes = await resp.read()
-        await bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo=BufferedInputFile(photo_bytes, filename="photo.jpg"),
-            caption=new_text
-        )
+
+        async def _send():
+            return await bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=BufferedInputFile(photo_bytes, filename="photo.jpg"),
+                caption=new_text
+            )
+        try:
+            sent = await throttled_publish(_send)
+            file_id_for_db = sent.photo[-1].file_id
+        except Exception as e:
+            logging.error(f"Failed to forward Bale photo: {e}")
+            return
+
     elif "video" in post:
+        content_type = "video"
         file_id = post["video"]["file_id"]
         async with session.get(f"{BALE_API_URL}/getFile", params={"file_id": file_id}) as resp:
             file_data = await resp.json()
@@ -824,15 +882,41 @@ async def handle_bale_channel_post(post: dict, session: aiohttp.ClientSession):
         file_path = file_data["result"]["file_path"]
         async with session.get(f"https://tapi.bale.ai/file/bot{BALE_BOT_TOKEN}/{file_path}") as resp:
             video_bytes = await resp.read()
-        await bot.send_video(
-            chat_id=CHANNEL_ID,
-            video=BufferedInputFile(video_bytes, filename="video.mp4"),
-            caption=new_text
-        )
-    else:
-        if new_text.strip():
-            await bot.send_message(chat_id=CHANNEL_ID, text=new_text)
 
+        async def _send():
+            return await bot.send_video(
+                chat_id=CHANNEL_ID,
+                video=BufferedInputFile(video_bytes, filename="video.mp4"),
+                caption=new_text
+            )
+        try:
+            sent = await throttled_publish(_send)
+            file_id_for_db = sent.video.file_id
+        except Exception as e:
+            logging.error(f"Failed to forward Bale video: {e}")
+            return
+
+    else:
+        if not new_text.strip():
+            return
+
+        async def _send():
+            return await bot.send_message(chat_id=CHANNEL_ID, text=new_text)
+        try:
+            sent = await throttled_publish(_send)
+        except Exception as e:
+            logging.error(f"Failed to forward Bale text: {e}")
+            return
+
+    # ── Record it so future duplicate checks (from anywhere) see it ──
+    post_id = await db.add_published_post(
+        content_type=content_type,
+        text=new_text,
+        file_id=file_id_for_db,
+        source_type="bale",
+        channel_msg_id=sent.message_id,
+    )
+    await db.log_action(post_id, "published")
 
 async def bale_listener():
     offset = 0
